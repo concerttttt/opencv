@@ -118,7 +118,6 @@ private:
     int height;
     int settingWidth;
     int settingHeight;
-    OSType mInputPixelFormat;
 
     int started;
 };
@@ -163,7 +162,6 @@ private:
 
     CMTime mFrameTimestamp;
     size_t mFrameNum;
-    OSType mInputPixelFormat;
 
     int started;
 };
@@ -295,7 +293,7 @@ void CvCaptureCAM::stopCaptureDevice() {
 
     [mCaptureSession release];
     [mCaptureDeviceInput release];
-    [mCaptureDevice release];
+    // [mCaptureDevice release]; fix #7833
 
     [mCaptureVideoDataOutput release];
     [mCapture release];

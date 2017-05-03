@@ -51,6 +51,7 @@
 #include "opencv2/core/ocl.hpp"
 #include "opencv2/core/hal/hal.hpp"
 #include "opencv2/imgproc/hal/hal.hpp"
+#include "hal_replacement.hpp"
 
 #include <math.h>
 #include <assert.h>
@@ -91,6 +92,19 @@ extern const float icv8x32fSqrTab[];
 
 #undef   CV_CALC_MAX
 #define  CV_CALC_MAX(a, b) if((a) < (b)) (a) = (b)
+
+#ifdef HAVE_IPP
+static inline IppiInterpolationType ippiGetInterpolation(int inter)
+{
+    inter &= cv::INTER_MAX;
+    return inter == cv::INTER_NEAREST ? ippNearest :
+        inter == cv::INTER_LINEAR ? ippLinear :
+        inter == cv::INTER_CUBIC ? ippCubic :
+        inter == cv::INTER_LANCZOS4 ? ippLanczos :
+        inter == cv::INTER_AREA ? ippSuper :
+        (IppiInterpolationType)-1;
+}
+#endif
 
 #include "_geom.h"
 #include "filterengine.hpp"

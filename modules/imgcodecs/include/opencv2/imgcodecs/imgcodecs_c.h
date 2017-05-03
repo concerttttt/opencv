@@ -39,8 +39,8 @@
 //
 //M*/
 
-#ifndef __OPENCV_IMGCODECS_H__
-#define __OPENCV_IMGCODECS_H__
+#ifndef OPENCV_IMGCODECS_H
+#define OPENCV_IMGCODECS_H
 
 #include "opencv2/core/core_c.h"
 
@@ -63,7 +63,9 @@ enum
 /* any depth, ? */
     CV_LOAD_IMAGE_ANYDEPTH   =2,
 /* ?, any color */
-    CV_LOAD_IMAGE_ANYCOLOR   =4
+    CV_LOAD_IMAGE_ANYCOLOR   =4,
+/* ?, no rotate */
+    CV_LOAD_IMAGE_IGNORE_ORIENTATION  =128
 };
 
 /* load image from file
@@ -143,4 +145,4 @@ CVAPI(int) cvHaveImageWriter(const char* filename);
 }
 #endif
 
-#endif // __OPENCV_IMGCODECS_H__
+#endif // OPENCV_IMGCODECS_H

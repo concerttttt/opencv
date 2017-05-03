@@ -42,19 +42,14 @@
 
 #include "precomp.hpp"
 #include "opencl_kernels_imgproc.hpp"
+#include "opencv2/core/hal/intrin.hpp"
 #include <queue>
+
+#include "opencv2/core/openvx/ovx_defs.hpp"
 
 #ifdef _MSC_VER
 #pragma warning( disable: 4127 ) // conditional expression is constant
 #endif
-
-
-#if defined (HAVE_IPP) && (IPP_VERSION_X100 >= 700)
-#define USE_IPP_CANNY 1
-#else
-#define USE_IPP_CANNY 0
-#endif
-
 
 namespace cv
 {
@@ -63,73 +58,79 @@ static void CannyImpl(Mat& dx_, Mat& dy_, Mat& _dst, double low_thresh, double h
 
 
 #ifdef HAVE_IPP
-template <bool useCustomDeriv>
-static bool ippCanny(const Mat& _src, const Mat& dx_, const Mat& dy_, Mat& _dst, float low, float high)
+static bool ipp_Canny(const Mat& src , const Mat& dx_, const Mat& dy_, Mat& dst, float low,  float high, bool L2gradient, int aperture_size)
 {
+#ifdef HAVE_IPP_IW
     CV_INSTRUMENT_REGION_IPP()
 
-#if USE_IPP_CANNY
-    if (!useCustomDeriv && _src.isSubmatrix())
-        return false; // IPP Sobel doesn't support transparent ROI border
+#if IPP_DISABLE_PERF_CANNY_MT
+    if(cv::getNumThreads()>1)
+        return false;
+#endif
 
-    int size = 0, size1 = 0;
-    IppiSize roi = { _src.cols, _src.rows };
+    ::ipp::IwiSize size(dst.cols, dst.rows);
+    IppDataType    type     = ippiGetDataType(dst.depth());
+    int            channels = dst.channels();
+    IppNormType    norm     = (L2gradient)?ippNormL2:ippNormL1;
 
-    if (ippiCannyGetSize(roi, &size) < 0)
+    if(size.width <= 3 || size.height <= 3)
         return false;
 
-    if (!useCustomDeriv)
+    if(channels != 1)
+        return false;
+
+    if(type != ipp8u)
+        return false;
+
+    if(src.empty())
     {
-#if IPP_VERSION_X100 < 900
-        if (ippiFilterSobelNegVertGetBufferSize_8u16s_C1R(roi, ippMskSize3x3, &size1) < 0)
-            return false;
-        size = std::max(size, size1);
-        if (ippiFilterSobelHorizGetBufferSize_8u16s_C1R(roi, ippMskSize3x3, &size1) < 0)
-            return false;
-#else
-        if (ippiFilterSobelNegVertBorderGetBufferSize(roi, ippMskSize3x3, ipp8u, ipp16s, 1, &size1) < 0)
-            return false;
-        size = std::max(size, size1);
-        if (ippiFilterSobelHorizBorderGetBufferSize(roi, ippMskSize3x3, ipp8u, ipp16s, 1, &size1) < 0)
-            return false;
-#endif
-        size = std::max(size, size1);
-    }
+        try
+        {
+            ::ipp::IwiImage iwSrcDx;
+            ::ipp::IwiImage iwSrcDy;
+            ::ipp::IwiImage iwDst;
 
-    AutoBuffer<uchar> buf(size + 64);
-    uchar* buffer = alignPtr((uchar*)buf, 32);
+            ippiGetImage(dx_, iwSrcDx);
+            ippiGetImage(dy_, iwSrcDy);
+            ippiGetImage(dst, iwDst);
 
-    Mat dx, dy;
-    if (!useCustomDeriv)
-    {
-        Mat _dx(_src.rows, _src.cols, CV_16S);
-        if( CV_INSTRUMENT_FUN_IPP(ippiFilterSobelNegVertBorder_8u16s_C1R, _src.ptr(), (int)_src.step,
-                        _dx.ptr<short>(), (int)_dx.step, roi,
-                        ippMskSize3x3, ippBorderRepl, 0, buffer) < 0 )
+            CV_INSTRUMENT_FUN_IPP(::ipp::iwiFilterCannyDeriv, &iwSrcDx, &iwSrcDy, &iwDst, norm, low, high);
+        }
+        catch (::ipp::IwException ex)
+        {
             return false;
-
-        Mat _dy(_src.rows, _src.cols, CV_16S);
-        if( CV_INSTRUMENT_FUN_IPP(ippiFilterSobelHorizBorder_8u16s_C1R, _src.ptr(), (int)_src.step,
-                        _dy.ptr<short>(), (int)_dy.step, roi,
-                        ippMskSize3x3, ippBorderRepl, 0, buffer) < 0 )
-            return false;
-
-        swap(dx, _dx);
-        swap(dy, _dy);
+        }
     }
     else
     {
-        dx = dx_;
-        dy = dy_;
+        IppiMaskSize kernel;
+
+        if(aperture_size == 3)
+            kernel = ippMskSize3x3;
+        else if(aperture_size == 5)
+            kernel = ippMskSize5x5;
+        else
+            return false;
+
+        try
+        {
+            ::ipp::IwiImage iwSrc;
+            ::ipp::IwiImage iwDst;
+
+            ippiGetImage(src, iwSrc);
+            ippiGetImage(dst, iwDst);
+
+            CV_INSTRUMENT_FUN_IPP(::ipp::iwiFilterCanny, &iwSrc, &iwDst, ippFilterSobel, kernel, norm, low, high, ippBorderRepl);
+        }
+        catch (::ipp::IwException)
+        {
+            return false;
+        }
     }
 
-    if( CV_INSTRUMENT_FUN_IPP(ippiCanny_16s8u_C1R, dx.ptr<short>(), (int)dx.step,
-                               dy.ptr<short>(), (int)dy.step,
-                              _dst.ptr(), (int)_dst.step, roi, low, high, buffer) < 0 )
-        return false;
     return true;
 #else
-    CV_UNUSED(_src); CV_UNUSED(dx_); CV_UNUSED(dy_); CV_UNUSED(_dst); CV_UNUSED(low); CV_UNUSED(high);
+    CV_UNUSED(src); CV_UNUSED(dx_); CV_UNUSED(dy_); CV_UNUSED(dst); CV_UNUSED(low); CV_UNUSED(high); CV_UNUSED(L2gradient); CV_UNUSED(aperture_size);
     return false;
 #endif
 }
@@ -141,6 +142,8 @@ template <bool useCustomDeriv>
 static bool ocl_Canny(InputArray _src, const UMat& dx_, const UMat& dy_, OutputArray _dst, float low_thresh, float high_thresh,
                       int aperture_size, bool L2gradient, int cn, const Size & size)
 {
+    CV_INSTRUMENT_REGION_OPENCL()
+
     UMat map;
 
     const ocl::Device &dev = ocl::Device::getDefault();
@@ -299,8 +302,8 @@ public:
 
     void operator()(const Range &boundaries) const
     {
-#if CV_SSE2
-        bool haveSSE2 = checkHardwareSupport(CV_CPU_SSE2);
+#if CV_SIMD128
+        bool haveSIMD = hasSIMD128();
 #endif
 
         const int type = src.type(), cn = CV_MAT_CN(type);
@@ -313,6 +316,8 @@ public:
         // In sobel transform we calculate ksize2 extra lines for the first and last rows of each slice
         // because IPPDerivSobel expects only isolated ROIs, in contrast with the opencv version which
         // uses the pixels outside of the ROI to form a border.
+        //
+        // TODO: statement above is not true anymore, so adjustments may be required
         int ksize2 = aperture_size / 2;
         // If Scharr filter: aperture_size is 3 and ksize2 is 1
         if(aperture_size == -1)
@@ -409,38 +414,27 @@ public:
             if (!L2gradient)
             {
                 int j = 0, width = src.cols * cn;
-#if CV_SSE2
-                if (haveSSE2)
+#if CV_SIMD128
+                if (haveSIMD)
                 {
-                    __m128i v_zero = _mm_setzero_si128();
                     for ( ; j <= width - 8; j += 8)
                     {
-                        __m128i v_dx = _mm_loadu_si128((const __m128i *)(_dx + j));
-                        __m128i v_dy = _mm_loadu_si128((const __m128i *)(_dy + j));
+                        v_int16x8 v_dx = v_load((const short *)(_dx + j));
+                        v_int16x8 v_dy = v_load((const short *)(_dy + j));
 
-                        __m128i v_dx_abs = _mm_max_epi16(v_dx, _mm_sub_epi16(v_zero, v_dx));
-                        __m128i v_dy_abs = _mm_max_epi16(v_dy, _mm_sub_epi16(v_zero, v_dy));
+                        v_dx = v_reinterpret_as_s16(v_abs(v_dx));
+                        v_dy = v_reinterpret_as_s16(v_abs(v_dy));
 
-                        __m128i v_dx_ml = _mm_unpacklo_epi16(v_dx_abs, v_zero);
-                        __m128i v_dy_ml = _mm_unpacklo_epi16(v_dy_abs, v_zero);
-                        __m128i v_dx_mh = _mm_unpackhi_epi16(v_dx_abs, v_zero);
-                        __m128i v_dy_mh = _mm_unpackhi_epi16(v_dy_abs, v_zero);
+                        v_int32x4 v_dx_ml;
+                        v_int32x4 v_dy_ml;
+                        v_int32x4 v_dx_mh;
+                        v_int32x4 v_dy_mh;
+                        v_expand(v_dx, v_dx_ml, v_dx_mh);
+                        v_expand(v_dy, v_dy_ml, v_dy_mh);
 
-                        __m128i v_norm_ml = _mm_add_epi32(v_dx_ml, v_dy_ml);
-                        __m128i v_norm_mh = _mm_add_epi32(v_dx_mh, v_dy_mh);
-
-                        _mm_storeu_si128((__m128i *)(_norm + j), v_norm_ml);
-                        _mm_storeu_si128((__m128i *)(_norm + j + 4), v_norm_mh);
+                        v_store((int *)(_norm + j), v_dx_ml + v_dy_ml);
+                        v_store((int *)(_norm + j + 4), v_dx_mh + v_dy_mh);
                     }
-                }
-#elif CV_NEON
-                for ( ; j <= width - 8; j += 8)
-                {
-                    int16x8_t v_dx = vld1q_s16(_dx + j), v_dy = vld1q_s16(_dy + j);
-                    vst1q_s32(_norm + j, vaddq_s32(vabsq_s32(vmovl_s16(vget_low_s16(v_dx))),
-                                                   vabsq_s32(vmovl_s16(vget_low_s16(v_dy)))));
-                    vst1q_s32(_norm + j + 4, vaddq_s32(vabsq_s32(vmovl_s16(vget_high_s16(v_dx))),
-                                                       vabsq_s32(vmovl_s16(vget_high_s16(v_dy)))));
                 }
 #endif
                 for ( ; j < width; ++j)
@@ -449,35 +443,22 @@ public:
             else
             {
                 int j = 0, width = src.cols * cn;
-#if CV_SSE2
-                if (haveSSE2)
+#if CV_SIMD128
+                if (haveSIMD)
                 {
-                    for ( ; j <= width - 8; j += 8)
+                   for ( ; j <= width - 8; j += 8)
                     {
-                        __m128i v_dx = _mm_loadu_si128((const __m128i *)(_dx + j));
-                        __m128i v_dy = _mm_loadu_si128((const __m128i *)(_dy + j));
+                        v_int16x8 v_dx = v_load((const short*)(_dx + j));
+                        v_int16x8 v_dy = v_load((const short*)(_dy + j));
 
-                        __m128i v_dx_dy_ml = _mm_unpacklo_epi16(v_dx, v_dy);
-                        __m128i v_dx_dy_mh = _mm_unpackhi_epi16(v_dx, v_dy);
+                        v_int32x4 v_dxp_low, v_dxp_high;
+                        v_int32x4 v_dyp_low, v_dyp_high;
+                        v_expand(v_dx, v_dxp_low, v_dxp_high);
+                        v_expand(v_dy, v_dyp_low, v_dyp_high);
 
-                        __m128i v_norm_ml = _mm_madd_epi16(v_dx_dy_ml, v_dx_dy_ml);
-                        __m128i v_norm_mh = _mm_madd_epi16(v_dx_dy_mh, v_dx_dy_mh);
-
-                        _mm_storeu_si128((__m128i *)(_norm + j), v_norm_ml);
-                        _mm_storeu_si128((__m128i *)(_norm + j + 4), v_norm_mh);
+                        v_store((int *)(_norm + j), v_dxp_low*v_dxp_low+v_dyp_low*v_dyp_low);
+                        v_store((int *)(_norm + j + 4), v_dxp_high*v_dxp_high+v_dyp_high*v_dyp_high);
                     }
-                }
-#elif CV_NEON
-                for ( ; j <= width - 8; j += 8)
-                {
-                    int16x8_t v_dx = vld1q_s16(_dx + j), v_dy = vld1q_s16(_dy + j);
-                    int16x4_t v_dxp = vget_low_s16(v_dx), v_dyp = vget_low_s16(v_dy);
-                    int32x4_t v_dst = vmlal_s16(vmull_s16(v_dxp, v_dxp), v_dyp, v_dyp);
-                    vst1q_s32(_norm + j, v_dst);
-
-                    v_dxp = vget_high_s16(v_dx), v_dyp = vget_high_s16(v_dy);
-                    v_dst = vmlal_s16(vmull_s16(v_dxp, v_dxp), v_dyp, v_dyp);
-                    vst1q_s32(_norm + j + 4, v_dst);
                 }
 #endif
                 for ( ; j < width; ++j)
@@ -529,30 +510,31 @@ public:
             const int TG22 = (int)(0.4142135623730950488016887242097*(1 << CANNY_SHIFT) + 0.5);
 
             int prev_flag = 0, j = 0;
-#if CV_SSE2
-            if (checkHardwareSupport(CPU_SSE2))
+#if CV_SIMD128
+            if (haveSIMD)
             {
-                __m128i v_low = _mm_set1_epi32(low), v_one = _mm_set1_epi8(1);
+                v_int32x4 v_low = v_setall_s32(low);
+                v_int8x16 v_one = v_setall_s8(1);
 
                 for (; j <= src.cols - 16; j += 16)
                 {
-                    __m128i v_m1 = _mm_loadu_si128((const __m128i*)(_mag + j));
-                    __m128i v_m2 = _mm_loadu_si128((const __m128i*)(_mag + j + 4));
-                    __m128i v_m3 = _mm_loadu_si128((const __m128i*)(_mag + j + 8));
-                    __m128i v_m4 = _mm_loadu_si128((const __m128i*)(_mag + j + 12));
+                    v_int32x4 v_m1 = v_load((const int*)(_mag + j));
+                    v_int32x4 v_m2 = v_load((const int*)(_mag + j + 4));
+                    v_int32x4 v_m3 = v_load((const int*)(_mag + j + 8));
+                    v_int32x4 v_m4 = v_load((const int*)(_mag + j + 12));
 
-                    _mm_storeu_si128((__m128i*)(_map + j), v_one);
+                    v_store((signed char*)(_map + j), v_one);
 
-                    __m128i v_cmp1 = _mm_cmpgt_epi32(v_m1, v_low);
-                    __m128i v_cmp2 = _mm_cmpgt_epi32(v_m2, v_low);
-                    __m128i v_cmp3 = _mm_cmpgt_epi32(v_m3, v_low);
-                    __m128i v_cmp4 = _mm_cmpgt_epi32(v_m4, v_low);
+                    v_int32x4 v_cmp1 = v_m1 > v_low;
+                    v_int32x4 v_cmp2 = v_m2 > v_low;
+                    v_int32x4 v_cmp3 = v_m3 > v_low;
+                    v_int32x4 v_cmp4 = v_m4 > v_low;
 
-                    v_cmp1 = _mm_packs_epi32(v_cmp1, v_cmp2);
-                    v_cmp2 = _mm_packs_epi32(v_cmp3, v_cmp4);
+                    v_int16x8 v_cmp80 = v_pack(v_cmp1, v_cmp2);
+                    v_int16x8 v_cmp81 = v_pack(v_cmp3, v_cmp4);
 
-                    v_cmp1 = _mm_packs_epi16(v_cmp1, v_cmp2);
-                    unsigned int mask = _mm_movemask_epi8(v_cmp1);
+                    v_int8x16 v_cmp = v_pack(v_cmp80, v_cmp81);
+                    unsigned int mask = v_signmask(v_cmp);
 
                     if (mask)
                     {
@@ -730,54 +712,57 @@ public:
         const uchar* pmap = map + mapstep + 1 + (ptrdiff_t)(mapstep * boundaries.start);
         uchar* pdst = dst.ptr() + (ptrdiff_t)(dst.step * boundaries.start);
 
-#if CV_SSE2
-        bool haveSSE2 = checkHardwareSupport(CV_CPU_SSE2);
+#if CV_SIMD128
+        bool haveSIMD = hasSIMD128();
 #endif
 
         for (int i = boundaries.start; i < boundaries.end; i++, pmap += mapstep, pdst += dst.step)
         {
             int j = 0;
-#if CV_SSE2
-            if(haveSSE2) {
-                const __m128i v_zero = _mm_setzero_si128();
+#if CV_SIMD128
+            if(haveSIMD) {
+                const v_int8x16 v_zero = v_setzero_s8();
 
                 for(; j <= dst.cols - 32; j += 32) {
-                    __m128i v_pmap1 = _mm_loadu_si128((const __m128i*)(pmap + j));
-                    __m128i v_pmap2 = _mm_loadu_si128((const __m128i*)(pmap + j + 16));
+                    v_uint8x16 v_pmap1 = v_load((const unsigned char*)(pmap + j));
+                    v_uint8x16 v_pmap2 = v_load((const unsigned char*)(pmap + j + 16));
 
-                    __m128i v_pmaplo1 = _mm_unpacklo_epi8(v_pmap1, v_zero);
-                    __m128i v_pmaphi1 = _mm_unpackhi_epi8(v_pmap1, v_zero);
-                    __m128i v_pmaplo2 = _mm_unpacklo_epi8(v_pmap2, v_zero);
-                    __m128i v_pmaphi2 = _mm_unpackhi_epi8(v_pmap2, v_zero);
+                    v_uint16x8 v_pmaplo1;
+                    v_uint16x8 v_pmaphi1;
+                    v_uint16x8 v_pmaplo2;
+                    v_uint16x8 v_pmaphi2;
+                    v_expand(v_pmap1, v_pmaplo1, v_pmaphi1);
+                    v_expand(v_pmap2, v_pmaplo2, v_pmaphi2);
 
-                    v_pmaplo1 = _mm_srli_epi16(v_pmaplo1, 1);
-                    v_pmaphi1 = _mm_srli_epi16(v_pmaphi1, 1);
-                    v_pmaplo2 = _mm_srli_epi16(v_pmaplo2, 1);
-                    v_pmaphi2 = _mm_srli_epi16(v_pmaphi2, 1);
+                    v_pmaplo1 = v_pmaplo1 >> 1;
+                    v_pmaphi1 = v_pmaphi1 >> 1;
+                    v_pmaplo2 = v_pmaplo2 >> 1;
+                    v_pmaphi2 = v_pmaphi2 >> 1;
 
-                    v_pmap1 = _mm_packus_epi16(v_pmaplo1, v_pmaphi1);
-                    v_pmap2 = _mm_packus_epi16(v_pmaplo2, v_pmaphi2);
+                    v_pmap1 = v_pack(v_pmaplo1, v_pmaphi1);
+                    v_pmap2 = v_pack(v_pmaplo2, v_pmaphi2);
 
-                    v_pmap1 = _mm_sub_epi8(v_zero, v_pmap1);
-                    v_pmap2 = _mm_sub_epi8(v_zero, v_pmap2);
+                    v_pmap1 = v_reinterpret_as_u8(v_zero - v_reinterpret_as_s8(v_pmap1));
+                    v_pmap2 = v_reinterpret_as_u8(v_zero - v_reinterpret_as_s8(v_pmap2));
 
-                    _mm_storeu_si128((__m128i*)(pdst + j), v_pmap1);
-                    _mm_storeu_si128((__m128i*)(pdst + j + 16), v_pmap2);
+                    v_store((pdst + j), v_pmap1);
+                    v_store((pdst + j + 16), v_pmap2);
                 }
 
                 for(; j <= dst.cols - 16; j += 16) {
-                    __m128i v_pmap = _mm_loadu_si128((const __m128i*)(pmap + j));
+                    v_uint8x16 v_pmap = v_load((const unsigned char*)(pmap + j));
 
-                    __m128i v_pmaplo = _mm_unpacklo_epi8(v_pmap, v_zero);
-                    __m128i v_pmaphi = _mm_unpackhi_epi8(v_pmap, v_zero);
+                    v_uint16x8 v_pmaplo;
+                    v_uint16x8 v_pmaphi;
+                    v_expand(v_pmap, v_pmaplo, v_pmaphi);
 
-                    v_pmaplo = _mm_srli_epi16(v_pmaplo, 1);
-                    v_pmaphi = _mm_srli_epi16(v_pmaphi, 1);
+                    v_pmaplo = v_pmaplo >> 1;
+                    v_pmaphi = v_pmaphi >> 1;
 
-                    v_pmap = _mm_packus_epi16(v_pmaplo, v_pmaphi);
-                    v_pmap = _mm_sub_epi8(v_zero, v_pmap);
+                    v_pmap = v_pack(v_pmaplo, v_pmaphi);
+                    v_pmap = v_reinterpret_as_u8(v_zero - v_reinterpret_as_s8(v_pmap));
 
-                    _mm_storeu_si128((__m128i*)(pdst + j), v_pmap);
+                    v_store((pdst + j), v_pmap);
                 }
             }
 #endif
@@ -791,6 +776,62 @@ private:
     Mat &dst;
     ptrdiff_t mapstep;
 };
+
+#ifdef HAVE_OPENVX
+static bool openvx_canny(const Mat& src, Mat& dst, int loVal, int hiVal, int kSize, bool useL2)
+{
+    using namespace ivx;
+
+    Context context = ovx::getOpenVXContext();
+    try
+    {
+    Image _src = Image::createFromHandle(
+                context,
+                Image::matTypeToFormat(src.type()),
+                Image::createAddressing(src),
+                src.data );
+    Image _dst = Image::createFromHandle(
+                context,
+                Image::matTypeToFormat(dst.type()),
+                Image::createAddressing(dst),
+                dst.data );
+    Threshold threshold = Threshold::createRange(context, VX_TYPE_UINT8, saturate_cast<uchar>(loVal), saturate_cast<uchar>(hiVal));
+
+#if 0
+    // the code below is disabled because vxuCannyEdgeDetector()
+    // ignores context attribute VX_CONTEXT_IMMEDIATE_BORDER
+
+    // FIXME: may fail in multithread case
+    border_t prevBorder = context.immediateBorder();
+    context.setImmediateBorder(VX_BORDER_REPLICATE);
+    IVX_CHECK_STATUS( vxuCannyEdgeDetector(context, _src, threshold, kSize, (useL2 ? VX_NORM_L2 : VX_NORM_L1), _dst) );
+    context.setImmediateBorder(prevBorder);
+#else
+    // alternative code without vxuCannyEdgeDetector()
+    Graph graph = Graph::create(context);
+    ivx::Node node = ivx::Node(vxCannyEdgeDetectorNode(graph, _src, threshold, kSize, (useL2 ? VX_NORM_L2 : VX_NORM_L1), _dst) );
+    node.setBorder(VX_BORDER_REPLICATE);
+    graph.verify();
+    graph.process();
+#endif
+
+#ifdef VX_VERSION_1_1
+    _src.swapHandle();
+    _dst.swapHandle();
+#endif
+    }
+    catch(const WrapperError& e)
+    {
+        VX_DbgThrow(e.what());
+    }
+    catch(const RuntimeError& e)
+    {
+        VX_DbgThrow(e.what());
+    }
+
+    return true;
+}
+#endif // HAVE_OPENVX
 
 void Canny( InputArray _src, OutputArray _dst,
                 double low_thresh, double high_thresh,
@@ -822,23 +863,37 @@ void Canny( InputArray _src, OutputArray _dst,
 
     Mat src = _src.getMat(), dst = _dst.getMat();
 
+    CV_OVX_RUN(
+        false && /* disabling due to accuracy issues */
+            src.type() == CV_8UC1 &&
+            !src.isSubmatrix() &&
+            src.cols >= aperture_size &&
+            src.rows >= aperture_size,
+        openvx_canny(
+            src,
+            dst,
+            cvFloor(low_thresh),
+            cvFloor(high_thresh),
+            aperture_size,
+            L2gradient ) )
+
 #ifdef HAVE_TEGRA_OPTIMIZATION
     if (tegra::useTegra() && tegra::canny(src, dst, low_thresh, high_thresh, aperture_size, L2gradient))
         return;
 #endif
 
-    CV_IPP_RUN(USE_IPP_CANNY && (aperture_size == 3 && !L2gradient && 1 == cn), ippCanny<false>(src, Mat(), Mat(), dst, (float)low_thresh, (float)high_thresh))
+    CV_IPP_RUN_FAST(ipp_Canny(src, Mat(), Mat(), dst, (float)low_thresh, (float)high_thresh, L2gradient, aperture_size))
 
-if (L2gradient)
-{
-    low_thresh = std::min(32767.0, low_thresh);
-    high_thresh = std::min(32767.0, high_thresh);
+    if (L2gradient)
+    {
+        low_thresh = std::min(32767.0, low_thresh);
+        high_thresh = std::min(32767.0, high_thresh);
 
-    if (low_thresh > 0) low_thresh *= low_thresh;
-    if (high_thresh > 0) high_thresh *= high_thresh;
-}
-int low = cvFloor(low_thresh);
-int high = cvFloor(high_thresh);
+        if (low_thresh > 0) low_thresh *= low_thresh;
+        if (high_thresh > 0) high_thresh *= high_thresh;
+    }
+    int low = cvFloor(low_thresh);
+    int high = cvFloor(high_thresh);
 
     ptrdiff_t mapstep = src.cols + 2;
     AutoBuffer<uchar> buffer((src.cols+2)*(src.rows+2) + cn * mapstep * 3 * sizeof(int));
@@ -883,15 +938,15 @@ int high = cvFloor(high_thresh);
     {
         m = borderPeaksParallel.front();
         borderPeaksParallel.pop();
-    if (!m[-1])         CANNY_PUSH_SERIAL(m - 1);
-    if (!m[1])          CANNY_PUSH_SERIAL(m + 1);
-    if (!m[-mapstep-1]) CANNY_PUSH_SERIAL(m - mapstep - 1);
-    if (!m[-mapstep])   CANNY_PUSH_SERIAL(m - mapstep);
-    if (!m[-mapstep+1]) CANNY_PUSH_SERIAL(m - mapstep + 1);
-    if (!m[mapstep-1])  CANNY_PUSH_SERIAL(m + mapstep - 1);
-    if (!m[mapstep])    CANNY_PUSH_SERIAL(m + mapstep);
-    if (!m[mapstep+1])  CANNY_PUSH_SERIAL(m + mapstep + 1);
-}
+        if (!m[-1])         CANNY_PUSH_SERIAL(m - 1);
+        if (!m[1])          CANNY_PUSH_SERIAL(m + 1);
+        if (!m[-mapstep-1]) CANNY_PUSH_SERIAL(m - mapstep - 1);
+        if (!m[-mapstep])   CANNY_PUSH_SERIAL(m - mapstep);
+        if (!m[-mapstep+1]) CANNY_PUSH_SERIAL(m - mapstep + 1);
+        if (!m[mapstep-1])  CANNY_PUSH_SERIAL(m + mapstep - 1);
+        if (!m[mapstep])    CANNY_PUSH_SERIAL(m + mapstep);
+        if (!m[mapstep+1])  CANNY_PUSH_SERIAL(m + mapstep + 1);
+    }
 
     parallel_for_(Range(0, dst.rows), finalPass(map, dst, mapstep), dst.total()/(double)(1<<16));
 }
@@ -900,6 +955,8 @@ void Canny( InputArray _dx, InputArray _dy, OutputArray _dst,
                 double low_thresh, double high_thresh,
                 bool L2gradient )
 {
+    CV_INSTRUMENT_REGION()
+
     CV_Assert(_dx.dims() == 2);
     CV_Assert(_dx.type() == CV_16SC1 || _dx.type() == CV_16SC3);
     CV_Assert(_dy.type() == _dx.type());
@@ -920,7 +977,7 @@ void Canny( InputArray _dx, InputArray _dy, OutputArray _dst,
     Mat dx = _dx.getMat();
     Mat dy = _dy.getMat();
 
-    CV_IPP_RUN(USE_IPP_CANNY && (!L2gradient && 1 == cn), ippCanny<true>(Mat(), dx, dy, dst, (float)low_thresh, (float)high_thresh))
+    CV_IPP_RUN_FAST(ipp_Canny(Mat(), dx, dy, dst, (float)low_thresh, (float)high_thresh, L2gradient, 0))
 
     if (cn > 1)
     {
@@ -980,8 +1037,8 @@ static void CannyImpl(Mat& dx, Mat& dy, Mat& dst,
     #define CANNY_PUSH(d)    *(d) = uchar(2), *stack_top++ = (d)
     #define CANNY_POP(d)     (d) = *--stack_top
 
-#if CV_SSE2
-    bool haveSSE2 = checkHardwareSupport(CV_CPU_SSE2);
+#if CV_SIMD128
+    bool haveSIMD = hasSIMD128();
 #endif
 
     // calculate magnitude and angle of gradient, perform non-maxima suppression.
@@ -1000,32 +1057,26 @@ static void CannyImpl(Mat& dx, Mat& dy, Mat& dst,
             if (!L2gradient)
             {
                 int j = 0, width = cols * cn;
-#if CV_SSE2
-                if (haveSSE2)
+#if CV_SIMD128
+                if (haveSIMD)
                 {
-                    __m128i v_zero = _mm_setzero_si128();
                     for ( ; j <= width - 8; j += 8)
                     {
-                        __m128i v_dx = _mm_loadu_si128((const __m128i *)(_dx + j));
-                        __m128i v_dy = _mm_loadu_si128((const __m128i *)(_dy + j));
-                        v_dx = _mm_max_epi16(v_dx, _mm_sub_epi16(v_zero, v_dx));
-                        v_dy = _mm_max_epi16(v_dy, _mm_sub_epi16(v_zero, v_dy));
+                        v_int16x8 v_dx = v_load((const short*)(_dx + j));
+                        v_int16x8 v_dy = v_load((const short*)(_dy + j));
 
-                        __m128i v_norm = _mm_add_epi32(_mm_unpacklo_epi16(v_dx, v_zero), _mm_unpacklo_epi16(v_dy, v_zero));
-                        _mm_storeu_si128((__m128i *)(_norm + j), v_norm);
+                        v_int32x4 v_dx0, v_dx1, v_dy0, v_dy1;
+                        v_expand(v_dx, v_dx0, v_dx1);
+                        v_expand(v_dy, v_dy0, v_dy1);
 
-                        v_norm = _mm_add_epi32(_mm_unpackhi_epi16(v_dx, v_zero), _mm_unpackhi_epi16(v_dy, v_zero));
-                        _mm_storeu_si128((__m128i *)(_norm + j + 4), v_norm);
+                        v_dx0 = v_reinterpret_as_s32(v_abs(v_dx0));
+                        v_dx1 = v_reinterpret_as_s32(v_abs(v_dx1));
+                        v_dy0 = v_reinterpret_as_s32(v_abs(v_dy0));
+                        v_dy1 = v_reinterpret_as_s32(v_abs(v_dy1));
+
+                        v_store(_norm + j, v_dx0 + v_dy0);
+                        v_store(_norm + j + 4, v_dx1 + v_dy1);
                     }
-                }
-#elif CV_NEON
-                for ( ; j <= width - 8; j += 8)
-                {
-                    int16x8_t v_dx = vld1q_s16(_dx + j), v_dy = vld1q_s16(_dy + j);
-                    vst1q_s32(_norm + j, vaddq_s32(vabsq_s32(vmovl_s16(vget_low_s16(v_dx))),
-                                                   vabsq_s32(vmovl_s16(vget_low_s16(v_dy)))));
-                    vst1q_s32(_norm + j + 4, vaddq_s32(vabsq_s32(vmovl_s16(vget_high_s16(v_dx))),
-                                                       vabsq_s32(vmovl_s16(vget_high_s16(v_dy)))));
                 }
 #endif
                 for ( ; j < width; ++j)
@@ -1034,33 +1085,23 @@ static void CannyImpl(Mat& dx, Mat& dy, Mat& dst,
             else
             {
                 int j = 0, width = cols * cn;
-#if CV_SSE2
-                if (haveSSE2)
+#if CV_SIMD128
+                if (haveSIMD)
                 {
                     for ( ; j <= width - 8; j += 8)
                     {
-                        __m128i v_dx = _mm_loadu_si128((const __m128i *)(_dx + j));
-                        __m128i v_dy = _mm_loadu_si128((const __m128i *)(_dy + j));
+                        v_int16x8 v_dx = v_load((const short*)(_dx + j));
+                        v_int16x8 v_dy = v_load((const short*)(_dy + j));
 
-                        __m128i v_dx_dy_ml = _mm_unpacklo_epi16(v_dx, v_dy);
-                        __m128i v_dx_dy_mh = _mm_unpackhi_epi16(v_dx, v_dy);
-                        __m128i v_norm_ml = _mm_madd_epi16(v_dx_dy_ml, v_dx_dy_ml);
-                        __m128i v_norm_mh = _mm_madd_epi16(v_dx_dy_mh, v_dx_dy_mh);
-                        _mm_storeu_si128((__m128i *)(_norm + j), v_norm_ml);
-                        _mm_storeu_si128((__m128i *)(_norm + j + 4), v_norm_mh);
+                        v_int16x8 v_dx_dy0, v_dx_dy1;
+                        v_zip(v_dx, v_dy, v_dx_dy0, v_dx_dy1);
+
+                        v_int32x4 v_dst0 = v_dotprod(v_dx_dy0, v_dx_dy0);
+                        v_int32x4 v_dst1 = v_dotprod(v_dx_dy1, v_dx_dy1);
+
+                        v_store(_norm + j, v_dst0);
+                        v_store(_norm + j + 4, v_dst1);
                     }
-                }
-#elif CV_NEON
-                for ( ; j <= width - 8; j += 8)
-                {
-                    int16x8_t v_dx = vld1q_s16(_dx + j), v_dy = vld1q_s16(_dy + j);
-                    int16x4_t v_dxp = vget_low_s16(v_dx), v_dyp = vget_low_s16(v_dy);
-                    int32x4_t v_dst = vmlal_s16(vmull_s16(v_dxp, v_dxp), v_dyp, v_dyp);
-                    vst1q_s32(_norm + j, v_dst);
-
-                    v_dxp = vget_high_s16(v_dx), v_dyp = vget_high_s16(v_dy);
-                    v_dst = vmlal_s16(vmull_s16(v_dxp, v_dxp), v_dyp, v_dyp);
-                    vst1q_s32(_norm + j + 4, v_dst);
                 }
 #endif
                 for ( ; j < width; ++j)
@@ -1112,30 +1153,31 @@ static void CannyImpl(Mat& dx, Mat& dy, Mat& dst,
         const int TG22 = (int)(0.4142135623730950488016887242097*(1<<CANNY_SHIFT) + 0.5);
 
         int prev_flag = 0, j = 0;
-#if CV_SSE2
-        if (checkHardwareSupport(CPU_SSE2))
+#if CV_SIMD128
+        if (haveSIMD)
         {
-            __m128i v_low = _mm_set1_epi32(low), v_one = _mm_set1_epi8(1);
+            v_int32x4 v_low = v_setall_s32(low);
+            v_int8x16 v_one = v_setall_s8(1);
 
             for (; j <= cols - 16; j += 16)
             {
-                __m128i v_m1 = _mm_loadu_si128((const __m128i*)(_mag + j));
-                __m128i v_m2 = _mm_loadu_si128((const __m128i*)(_mag + j + 4));
-                __m128i v_m3 = _mm_loadu_si128((const __m128i*)(_mag + j + 8));
-                __m128i v_m4 = _mm_loadu_si128((const __m128i*)(_mag + j + 12));
+                v_int32x4 v_m1 = v_load((const int*)(_mag + j));
+                v_int32x4 v_m2 = v_load((const int*)(_mag + j + 4));
+                v_int32x4 v_m3 = v_load((const int*)(_mag + j + 8));
+                v_int32x4 v_m4 = v_load((const int*)(_mag + j + 12));
 
-                _mm_storeu_si128((__m128i*)(_map + j), v_one);
+                v_store((signed char*)(_map + j), v_one);
 
-                __m128i v_cmp1 = _mm_cmpgt_epi32(v_m1, v_low);
-                __m128i v_cmp2 = _mm_cmpgt_epi32(v_m2, v_low);
-                __m128i v_cmp3 = _mm_cmpgt_epi32(v_m3, v_low);
-                __m128i v_cmp4 = _mm_cmpgt_epi32(v_m4, v_low);
+                v_int32x4 v_cmp1 = v_m1 > v_low;
+                v_int32x4 v_cmp2 = v_m2 > v_low;
+                v_int32x4 v_cmp3 = v_m3 > v_low;
+                v_int32x4 v_cmp4 = v_m4 > v_low;
 
-                v_cmp1 = _mm_packs_epi32(v_cmp1, v_cmp2);
-                v_cmp2 = _mm_packs_epi32(v_cmp3, v_cmp4);
+                v_int16x8 v_cmp80 = v_pack(v_cmp1, v_cmp2);
+                v_int16x8 v_cmp81 = v_pack(v_cmp3, v_cmp4);
 
-                v_cmp1 = _mm_packs_epi16(v_cmp1, v_cmp2);
-                unsigned int mask = _mm_movemask_epi8(v_cmp1);
+                v_int8x16 v_cmp = v_pack(v_cmp80, v_cmp81);
+                unsigned int mask = v_signmask(v_cmp);
 
                 if (mask)
                 {

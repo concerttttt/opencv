@@ -40,8 +40,8 @@
 //
 //M*/
 
-#ifndef __OPENCV_PHOTO_HPP__
-#define __OPENCV_PHOTO_HPP__
+#ifndef OPENCV_PHOTO_HPP
+#define OPENCV_PHOTO_HPP
 
 #include "opencv2/core.hpp"
 #include "opencv2/imgproc.hpp"
@@ -748,7 +748,7 @@ complex outlines into a new background
 consuming and often leaves an undesirable halo. Seamless cloning, even averaged with the
 original image, is not effective. Mixed seamless cloning based on a loose selection proves
 effective.
--   **FEATURE_EXCHANGE** Feature exchange allows the user to easily replace certain features of
+-   **MONOCHROME_TRANSFER** Monochrome transfer allows the user to easily replace certain features of
 one object by alternative features.
  */
 CV_EXPORTS_W void seamlessClone( InputArray src, InputArray dst, InputArray mask, Point p,
